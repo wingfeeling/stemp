@@ -1,396 +1,335 @@
 import os
-import sys
-import traceback
-from tkinter import *
-from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import PyPDF2
-from pdf2image import convert_from_path
-import logging
-from logging.handlers import RotatingFileHandler
+import img2pdf
+import io
+import tkinter as tk
+from tkinter import Toplevel, Text, Scrollbar
 
-# 常量定义
-A4_WIDTH_POINTS = 595.0  # A4宽度（点）
-A4_HEIGHT_POINTS = 842.0  # A4高度（点）
-TARGET_STAMP_WIDTH_POINTS = 100.0  # 目标电子章宽度（点）
-supported_pdf_formats = ('.pdf',)
-supported_image_formats = ('.png', '.jpg', '.jpeg', '.bmp', '.gif')
+# 定義路徑
+base_dir = os.path.dirname(os.path.abspath(__file__))
+source_folder = os.path.join(base_dir, "原始檔")
+stamp_path = os.path.join(base_dir, "樣章.png")
+target_folder = os.path.join(base_dir, "批次蓋章完成")
 
-# 初始化全局变量
-selected_files = []
-stamp = None
-stamp_width = 0
-stamp_height = 0
-offset_x = 0
-offset_y = 0
-offset_x_points = 0
-offset_y_points = 0
-drag_window = None
-preview_image = None
-preview_canvas = None
-stamp_image_on_canvas = None
+# 日誌函數：將訊息打印到控制台
+def log_message(message):
+    print(f"[LOG] {message}")
 
-# 设置日志
-def setup_logging():
-    log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    log_file = "pdf_stamp.log"
-    
-    handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=2)
-    handler.setFormatter(log_formatter)
-    
-    logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(handler)
-
-def log_message(message, level="info"):
-    if level == "debug":
-        logging.debug(message)
-    elif level == "warning":
-        logging.warning(message)
-    elif level == "error":
-        logging.error(message)
-    else:
-        logging.info(message)
-
+# 自訂錯誤訊息視窗（不自動關閉）
 def show_error_message(title, message):
-    log_message(f"{title}: {message}", level="error")
-    messagebox.showerror(title, message)
+    log_message(f"錯誤訊息：{message}")
+    error_window = Toplevel()
+    error_window.title(title)
+    error_window.geometry("500x300")
+    
+    text_area = Text(error_window, wrap="word")
+    scrollbar = Scrollbar(error_window, orient="vertical", command=text_area.yview)
+    text_area.configure(yscrollcommand=scrollbar.set)
+    
+    text_area.insert("end", message)
+    text_area.config(state="disabled")
+    
+    text_area.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    
+    error_window.protocol("WM_DELETE_WINDOW", lambda: error_window.destroy())
+    error_window.mainloop()
 
-def show_info_message(title, message):
-    log_message(f"{title}: {message}", level="info")
-    messagebox.showinfo(title, message)
+# 檢查目標資料夾是否存在並有寫入權限
+log_message(f"檢查目標資料夾：{target_folder}")
+try:
+    if not os.path.exists(target_folder):
+        os.makedirs(target_folder)
+    test_file = os.path.join(target_folder, "test.txt")
+    with open(test_file, "w") as f:
+        f.write("test")
+    os.remove(test_file)
+    log_message("目標資料夾可寫入")
+except Exception as e:
+    log_message(f"目標資料夾無法寫入：{e}")
+    show_error_message("錯誤", f"目標資料夾無法寫入：{e}")
+    raise
 
-def select_files():
-    global selected_files
-    files = filedialog.askopenfilenames(
-        title="选择PDF或图片文件",
-        filetypes=[("PDF文件", "*.pdf"), ("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif"), ("所有文件", "*.*")]
-    )
-    if files:
-        selected_files = list(files)
-        log_message(f"已选择文件: {selected_files}", level="debug")
-        show_info_message("选择成功", f"已选择 {len(selected_files)} 个文件")
-    else:
-        log_message("未选择任何文件", level="warning")
+# 載入電子章並轉為 RGBA 模式
+log_message(f"載入電子章：{stamp_path}")
+try:
+    stamp = Image.open(stamp_path).convert("RGBA")
+    stamp_width, stamp_height = stamp.size
+    log_message("電子章載入成功")
+except Exception as e:
+    log_message(f"無法載入電子章圖片：{e}")
+    show_error_message("錯誤", f"無法載入電子章圖片：{e}")
+    raise
 
-def select_stamp():
-    global stamp, stamp_width, stamp_height
-    file = filedialog.askopenfilename(
-        title="选择电子章图片",
-        filetypes=[("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif")]
-    )
-    if file:
-        try:
-            stamp = Image.open(file).convert("RGBA")
-            stamp_width, stamp_height = stamp.size
-            log_message(f"已选择电子章: {file}, 尺寸: {stamp_width}x{stamp_height}", level="debug")
-            show_info_message("选择成功", "电子章已载入")
-        except Exception as e:
-            log_message(f"载入电子章失败: {traceback.format_exc()}", level="error")
-            show_error_message("错误", f"无法载入电子章: {e}")
+# A4 紙尺寸（單位：毫米）
+A4_WIDTH_MM = 210
+A4_HEIGHT_MM = 297
+POINTS_PER_MM = 72 / 25.4
+A4_WIDTH_POINTS = A4_WIDTH_MM * POINTS_PER_MM
+A4_HEIGHT_POINTS = A4_HEIGHT_MM * POINTS_PER_MM
 
+# 目標電子章寬度：50 毫米
+TARGET_STAMP_WIDTH_MM = 50
+TARGET_STAMP_WIDTH_POINTS = TARGET_STAMP_WIDTH_MM * POINTS_PER_MM
+
+# 支援的檔案格式
+supported_image_formats = (".jpg", ".jpeg", ".png")
+supported_pdf_formats = (".pdf",)
+
+# 儲存拖曳後的偏移量（單位：點）
+offset_x_points = 60  # 距離右邊的偏移量（點）
+offset_y_points = 50  # 距離底部的偏移量（點）
+
+# GUI 拖曳介面
 def create_drag_window():
-    global offset_x_points, offset_y_points, drag_window, preview_image, preview_canvas, stamp_image_on_canvas
-    log_message("开始创建拖曳视窗", level="debug")
-    
-    if not selected_files:
-        show_error_message("错误", "请先选择PDF文件")
-        return None
-    
-    if not stamp:
-        show_error_message("错误", "请先选择电子章")
-        return None
-    
-    try:
-        sample_file = selected_files[0]
-        log_message(f"范例档案：{sample_file}", level="debug")
-
-        # 取得PDF的实际尺寸（以点为单位）
-        if sample_file.lower().endswith(supported_pdf_formats):
-            try:
-                pdf_reader = PyPDF2.PdfReader(sample_file)
-                page = pdf_reader.pages[0]
-                pdf_width_points = float(page.mediabox.width)
-                pdf_height_points = float(page.mediabox.height)
-                
-                # 标准A4尺寸（以点为单位）
-                standard_a4_width = A4_WIDTH_POINTS
-                standard_a4_height = A4_HEIGHT_POINTS
-                
-                # 计算比例因子
-                scale_x = pdf_width_points / standard_a4_width
-                scale_y = pdf_height_points / standard_a4_height
-                scale_factor = (scale_x + scale_y) / 2
-                log_message(f"PDF比例因子：{scale_factor}", level="debug")
-                
-                # 调整电子章大小使其在物理尺寸上保持一致
-                target_stamp_width_points = TARGET_STAMP_WIDTH_POINTS * scale_factor
-                stamp_scale = target_stamp_width_points / stamp_width
-                new_stamp_width = int(stamp_width * stamp_scale)
-                new_stamp_height = int(stamp_height * stamp_scale)
-                
-                # 载入PDF页面为图片，保持原比例
-                images = convert_from_path(sample_file, dpi=72, first_page=1, last_page=1)
-                sample_image = images[0].convert("RGBA")
-                
-            except Exception as e:
-                log_message(f"PDF处理错误：{traceback.format_exc()}", level="error")
-                show_error_message("错误", f"PDF处理错误：{e}")
-                return None
-        else:
-            # 处理图片档案的部分
-            try:
-                sample_image = Image.open(sample_file).convert("RGBA")
-                pdf_width_points = A4_WIDTH_POINTS
-                pdf_height_points = A4_HEIGHT_POINTS
-                scale_factor = 1.0
-                
-                # 调整电子章大小
-                target_stamp_width_points = TARGET_STAMP_WIDTH_POINTS
-                stamp_scale = target_stamp_width_points / stamp_width
-                new_stamp_width = int(stamp_width * stamp_scale)
-                new_stamp_height = int(stamp_height * stamp_scale)
-                
-            except Exception as e:
-                log_message(f"无法载入图片：{traceback.format_exc()}", level="error")
-                show_error_message("错误", f"无法载入图片：{e}")
-                return None
-
-        # 调整电子章大小
-        resized_stamp = stamp.resize((new_stamp_width, new_stamp_height), Image.Resampling.LANCZOS)
-        
-        # 创建预览视窗
-        try:
-            sample_image.thumbnail((800, 600), Image.Resampling.LANCZOS)
-            sample_width, sample_height = sample_image.size
-            
-            drag_window = Toplevel()
-            drag_window.title("电子章位置调整")
-            drag_window.geometry(f"{sample_width+20}x{sample_height+20}")
-            
-            preview_image = ImageTk.PhotoImage(sample_image)
-            preview_canvas = Canvas(drag_window, width=sample_width, height=sample_height)
-            preview_canvas.create_image(0, 0, anchor=NW, image=preview_image)
-            preview_canvas.pack()
-            
-            # 计算电子章在预览图上的比例
-            preview_scale_x = sample_width / pdf_width_points
-            preview_scale_y = sample_height / pdf_height_points
-            preview_scale = (preview_scale_x + preview_scale_y) / 2
-            
-            # 放置电子章
-            stamp_preview_width = int(new_stamp_width * preview_scale)
-            stamp_preview_height = int(new_stamp_height * preview_scale)
-            resized_stamp_preview = resized_stamp.resize((stamp_preview_width, stamp_preview_height), Image.Resampling.LANCZOS)
-            stamp_tk_image = ImageTk.PhotoImage(resized_stamp_preview)
-            
-            # 初始位置设为中心
-            initial_x = (sample_width - stamp_preview_width) // 2
-            initial_y = (sample_height - stamp_preview_height) // 2
-            
-            stamp_image_on_canvas = preview_canvas.create_image(
-                initial_x, initial_y, 
-                anchor=NW, 
-                image=stamp_tk_image,
-                tags="stamp"
-            )
-            
-            # 计算初始偏移量（点）
-            offset_x_points = (initial_x / preview_scale)
-            offset_y_points = (initial_y / preview_scale)
-            
-            # 绑定拖曳事件
-            preview_canvas.tag_bind("stamp", "<B1-Motion>", drag_stamp)
-            
-            # 保持图片引用
-            drag_window.stamp_tk_image = stamp_tk_image
-            drag_window.preview_image = preview_image
-            
-        except Exception as e:
-            log_message(f"创建拖曳视窗失败：{traceback.format_exc()}", level="error")
-            show_error_message("错误", f"创建拖曳视窗失败：{e}")
-            return None
-
-    except Exception as e:
-        log_message(f"拖曳视窗处理失败：{traceback.format_exc()}", level="error")
-        show_error_message("错误", f"拖曳视窗处理失败：{e}")
-        return None
-
-def drag_stamp(event):
     global offset_x_points, offset_y_points
-    if not drag_window or not preview_canvas:
-        return
-    
-    try:
-        # 获取当前电子章位置
-        coords = preview_canvas.coords(stamp_image_on_canvas)
-        if not coords:
-            return
-            
-        # 计算新位置
-        new_x = event.x
-        new_y = event.y
-        
-        # 更新电子章位置
-        preview_canvas.coords(stamp_image_on_canvas, new_x, new_y)
-        
-        # 获取PDF页面尺寸
-        sample_file = selected_files[0]
-        if sample_file.lower().endswith(supported_pdf_formats):
-            pdf_reader = PyPDF2.PdfReader(sample_file)
-            page = pdf_reader.pages[0]
-            pdf_width_points = float(page.mediabox.width)
-            pdf_height_points = float(page.mediabox.height)
-        else:
-            pdf_width_points = A4_WIDTH_POINTS
-            pdf_height_points = A4_HEIGHT_POINTS
-        
-        # 计算预览图比例
-        preview_width = preview_canvas.winfo_width()
-        preview_height = preview_canvas.winfo_height()
-        preview_scale_x = preview_width / pdf_width_points
-        preview_scale_y = preview_height / pdf_height_points
-        preview_scale = (preview_scale_x + preview_scale_y) / 2
-        
-        # 更新偏移量（点）
-        offset_x_points = new_x / preview_scale
-        offset_y_points = new_y / preview_scale
-        
-    except Exception as e:
-        log_message(f"拖曳电子章失败：{traceback.format_exc()}", level="error")
-        show_error_message("错误", f"拖曳电子章失败：{e}")
+    log_message("開始創建拖曳視窗")
 
-def process_pdf(pdf_path, output_path):
-    log_message(f"开始处理 PDF：{pdf_path}", level="debug")
-    try:
-        pdf_reader = PyPDF2.PdfReader(pdf_path)
+    # 尋找第一個支援的檔案作為範例
+    sample_file = None
+    for filename in os.listdir(source_folder):
+        if filename.lower().endswith(supported_image_formats + supported_pdf_formats):
+            sample_file = os.path.join(source_folder, filename)
+            break
+    if not sample_file:
+        log_message("來源資料夾中沒有支援的檔案")
+        show_error_message("錯誤", "來源資料夾中沒有支援的檔案！")
+        return None
+
+    log_message(f"範例檔案：{sample_file}")
+
+    # 載入範例圖片
+    if sample_file.lower().endswith(supported_image_formats):
+        try:
+            sample_image = Image.open(sample_file).convert("RGBA")
+            page_width = A4_WIDTH_POINTS
+            page_height = A4_HEIGHT_POINTS
+            log_message("圖片載入成功")
+        except Exception as e:
+            log_message(f"無法載入圖片：{e}")
+            show_error_message("錯誤", f"無法載入圖片：{e}")
+            return None
+    else:  # PDF
+        try:
+            images = convert_from_path(sample_file, dpi=72, first_page=1, last_page=1)
+            sample_image = images[0].convert("RGBA")
+            log_message("PDF 轉圖片成功")
+        except Exception as e:
+            log_message(f"無法轉換 PDF 為圖片：{e}")
+            show_error_message("錯誤", f"無法轉換 PDF 為圖片：{e}\n請確保已安裝 poppler 並加入環境變數。")
+            return None
+        pdf_reader = PyPDF2.PdfReader(sample_file)
         page = pdf_reader.pages[0]
         page_width = float(page.mediabox.width)
         page_height = float(page.mediabox.height)
-        
-        # 标准A4尺寸
-        standard_a4_width = A4_WIDTH_POINTS
-        standard_a4_height = A4_HEIGHT_POINTS
-        
-        # 计算比例因子
-        scale_x = page_width / standard_a4_width
-        scale_y = page_height / standard_a4_height
-        scale_factor = (scale_x + scale_y) / 2
-        
-        # 调整电子章大小使其在物理尺寸上保持一致
-        target_stamp_width_points = TARGET_STAMP_WIDTH_POINTS * scale_factor
-        stamp_scale = target_stamp_width_points / stamp_width
+        log_message(f"PDF 頁面尺寸：{page_width}x{page_height}")
+
+    # 縮放圖片以適應視窗（假設視窗最大 800x600）
+    sample_image.thumbnail((800, 600), Image.Resampling.LANCZOS)
+    sample_width, sample_height = sample_image.size
+    log_message(f"預覽圖片尺寸：{sample_width}x{sample_height}")
+
+    # 計算縮放比例
+    scale_x = sample_width / page_width
+    scale_y = sample_height / page_height
+    log_message(f"縮放比例：X={scale_x}, Y={scale_y}")
+
+    # 調整電子章大小
+    stamp_width_pixels = TARGET_STAMP_WIDTH_POINTS * scale_x
+    stamp_scale = stamp_width_pixels / stamp_width
+    new_stamp_width = int(stamp_width * stamp_scale)
+    new_stamp_height = int(stamp_height * stamp_scale)
+    resized_stamp = stamp.resize((new_stamp_width, new_stamp_height), Image.Resampling.LANCZOS)
+    log_message(f"電子章縮放後尺寸：{new_stamp_width}x{new_stamp_height}")
+
+    # 創建 Tkinter 視窗
+    root = tk.Tk()
+    root.title("拖曳電子章位置")
+    canvas = tk.Canvas(root, width=sample_width, height=sample_height)
+    canvas.pack()
+
+    # 顯示範例圖片
+    sample_photo = ImageTk.PhotoImage(sample_image)
+    canvas.create_image(0, 0, anchor="nw", image=sample_photo)
+
+    # 顯示電子章（初始位置：右下角）
+    stamp_photo = ImageTk.PhotoImage(resized_stamp)
+    stamp_id = canvas.create_image(sample_width - new_stamp_width - (offset_x_points * scale_x), 
+                                  sample_height - new_stamp_height - (offset_y_points * scale_y), 
+                                  anchor="nw", image=stamp_photo)
+
+    # 添加「完成」按鈕
+    def on_finish():
+        stamp_x = canvas.coords(stamp_id)[0]
+        stamp_y = canvas.coords(stamp_id)[1]
+        offset_x_pixels = sample_width - stamp_x - new_stamp_width
+        offset_y_pixels = sample_height - stamp_y - new_stamp_height
+        global offset_x_points, offset_y_points
+        offset_x_points = offset_x_pixels / scale_x
+        offset_y_points = offset_y_pixels / scale_y
+        log_message(f"拖曳完成，偏移量：X={offset_x_points}, Y={offset_y_points}")
+        root.destroy()
+
+    finish_button = tk.Button(root, text="完成拖曳", command=on_finish)
+    finish_button.pack()
+
+    # 拖曳邏輯
+    def start_drag(event):
+        canvas.data = {"x": event.x, "y": event.y}
+
+    def dragging(event):
+        dx = event.x - canvas.data["x"]
+        dy = event.y - canvas.data["y"]
+        canvas.move(stamp_id, dx, dy)
+        canvas.data["x"] = event.x
+        canvas.data["y"] = event.y
+
+    canvas.bind("<Button-1>", start_drag)
+    canvas.bind("<B1-Motion>", dragging)
+
+    root.mainloop()
+    return offset_x_points, offset_y_points
+
+# 處理圖片檔案的函數
+def process_image(image_path, output_path):
+    log_message(f"開始處理圖片：{image_path}")
+    try:
+        image = Image.open(image_path).convert("RGBA")
+        image_width, image_height = image.size
+
+        try:
+            dpi = image.info.get("dpi", (96, 96))[0]
+        except:
+            dpi = 96
+
+        image_width_mm = (image_width / dpi) * 25.4
+        scale_factor = A4_WIDTH_MM / image_width_mm
+        stamp_width_mm = TARGET_STAMP_WIDTH_MM / scale_factor
+        stamp_width_pixels = (stamp_width_mm / 25.4) * dpi
+
+        stamp_scale = stamp_width_pixels / stamp_width
         new_stamp_width = int(stamp_width * stamp_scale)
         new_stamp_height = int(stamp_height * stamp_scale)
-        
-        # 调整电子章图片大小
         resized_stamp = stamp.resize((new_stamp_width, new_stamp_height), Image.Resampling.LANCZOS)
-        
-        # 创建PDF页面的图片
-        images = convert_from_path(pdf_path, dpi=300, first_page=1, last_page=1)
-        pdf_image = images[0].convert("RGBA")
-        
-        # 计算电子章位置
-        stamp_x = int(offset_x_points * (page_width / A4_WIDTH_POINTS))
-        stamp_y = int(offset_y_points * (page_height / A4_HEIGHT_POINTS))
-        
-        # 将电子章盖在PDF图片上
-        pdf_image.paste(resized_stamp, (stamp_x, stamp_y), resized_stamp)
-        
-        # 保存为临时图片
-        temp_image_path = "temp_processed.png"
-        pdf_image.save(temp_image_path, "PNG")
-        
-        # 将图片转换回PDF
-        pdf_writer = PyPDF2.PdfWriter()
-        pdf_writer.add_page(page)
-        
-        with open(output_path, "wb") as output_file:
-            pdf_writer.write(output_file)
-        
-        # 删除临时文件
-        if os.path.exists(temp_image_path):
-            os.remove(temp_image_path)
-            
-        log_message(f"PDF处理完成：{output_path}", level="info")
-        
+        log_message(f"圖片電子章調整大小：{new_stamp_width}x{new_stamp_height}")
+
+        # 使用拖曳後的偏移量（轉為圖片像素）
+        scale_x = image_width / A4_WIDTH_POINTS
+        scale_y = image_height / A4_HEIGHT_POINTS
+        position_x = image_width - new_stamp_width - (offset_x_points * scale_x)
+        position_y = image_height - new_stamp_height - (offset_y_points * scale_y)
+        # 將浮點數轉為整數
+        position_x = int(position_x)
+        position_y = int(position_y)
+        position = (position_x, position_y)
+        log_message(f"圖片電子章位置：X={position_x}, Y={position_y}")
+
+        image.paste(resized_stamp, position, resized_stamp)
+
+        if image_path.lower().endswith((".jpg", ".jpeg")):
+            image = image.convert("RGB")
+
+        image.save(output_path)
+        log_message(f"已處理並儲存圖片：{output_path}")
+
     except Exception as e:
-        log_message(f"处理 PDF 时出错：{traceback.format_exc()}", level="error")
-        show_error_message("错误", f"处理 PDF 时出错：{e}")
+        log_message(f"處理圖片時出錯：{e}")
+        show_error_message("錯誤", f"處理圖片時出錯：{e}")
         raise
 
-def process_files():
-    if not selected_files:
-        show_error_message("错误", "请先选择PDF文件")
-        return
-    
-    if not stamp:
-        show_error_message("错误", "请先选择电子章")
-        return
-    
-    if not drag_window:
-        show_error_message("错误", "请先调整电子章位置")
-        return
-    
-    output_dir = filedialog.askdirectory(title="选择输出目录")
-    if not output_dir:
-        return
-    
-    progress = ttk.Progressbar(root, orient=HORIZONTAL, length=300, mode='determinate')
-    progress.pack(pady=10)
-    progress['maximum'] = len(selected_files)
-    
-    processed_count = 0
-    for i, file_path in enumerate(selected_files):
-        try:
-            file_name = os.path.basename(file_path)
-            output_path = os.path.join(output_dir, f"stamped_{file_name}")
-            
-            if file_path.lower().endswith(supported_pdf_formats):
-                process_pdf(file_path, output_path)
-            else:
-                # 处理图片文件（略）
-                pass
-            
-            processed_count += 1
-            progress['value'] = i + 1
-            root.update_idletasks()
-            
-        except Exception as e:
-            log_message(f"处理文件 {file_path} 失败：{traceback.format_exc()}", level="error")
-            show_error_message("错误", f"处理文件 {file_path} 失败：{e}")
-            continue
-    
-    progress.destroy()
-    show_info_message("完成", f"已成功处理 {processed_count}/{len(selected_files)} 个文件")
+# 處理 PDF 檔案的函數
+def process_pdf(pdf_path, output_path):
+    log_message(f"開始處理 PDF：{pdf_path}")
+    try:
+        pdf_dpi = 72
+        stamp_width_pixels = TARGET_STAMP_WIDTH_POINTS * (pdf_dpi / 72)
+        stamp_scale = stamp_width_pixels / stamp_width
+        new_stamp_width = int(stamp_width * stamp_scale)
+        new_stamp_height = int(stamp_height * stamp_scale)
+        resized_stamp = stamp.resize((new_stamp_width, new_stamp_height), Image.Resampling.LANCZOS)
+        log_message(f"PDF 電子章調整大小：{new_stamp_width}x{new_stamp_height}")
 
-# 主视窗
-def create_main_window():
-    global root
-    root = Tk()
-    root.title("PDF电子章工具")
-    root.geometry("400x300")
-    
-    # 设置日志
-    setup_logging()
-    
-    # 创建UI元素
-    frame = Frame(root)
-    frame.pack(pady=20)
-    
-    btn_select_files = Button(frame, text="选择PDF文件", command=select_files)
-    btn_select_files.pack(side=LEFT, padx=10)
-    
-    btn_select_stamp = Button(frame, text="选择电子章", command=select_stamp)
-    btn_select_stamp.pack(side=LEFT, padx=10)
-    
-    btn_adjust_position = Button(root, text="调整电子章位置", command=create_drag_window)
-    btn_adjust_position.pack(pady=10)
-    
-    btn_process = Button(root, text="处理文件", command=process_files)
-    btn_process.pack(pady=10)
-    
-    root.mainloop()
+        if resized_stamp.mode == "RGBA":
+            resized_stamp = resized_stamp.convert("RGB")
 
-if __name__ == "__main__":
-    create_main_window()
+        temp_stamp_path = os.path.join(target_folder, "resized_stamp.png")
+        resized_stamp.save(temp_stamp_path, "PNG")
+        log_message(f"已生成臨時電子章圖片：{temp_stamp_path}")
+
+        stamp_pdf_path = os.path.join(target_folder, "stamp_temp.pdf")
+        with open(stamp_pdf_path, "wb") as f:
+            f.write(img2pdf.convert(temp_stamp_path, dpi=pdf_dpi))
+        log_message(f"已將電子章轉為 PDF：{stamp_pdf_path}")
+
+        pdf_reader = PyPDF2.PdfReader(pdf_path)
+        stamp_pdf_reader = PyPDF2.PdfReader(stamp_pdf_path)
+        stamp_page = stamp_pdf_reader.pages[0]
+        log_message("PDF 檔案載入成功")
+
+        pdf_writer = PyPDF2.PdfWriter()
+
+        for page_num in range(len(pdf_reader.pages)):
+            page = pdf_reader.pages[page_num]
+            page_width = float(page.mediabox.width)
+            page_height = float(page.mediabox.height)
+
+            stamp_width_points = TARGET_STAMP_WIDTH_POINTS
+            stamp_height_points = stamp_height * (stamp_width_points / stamp_width)
+            log_message(f"PDF 電子章最終尺寸：{stamp_width_points}x{stamp_height_points}")
+
+            position_x = page_width - stamp_width_points - offset_x_points
+            position_y = offset_y_points
+            log_message(f"PDF 電子章位置：X={position_x}, Y={position_y}")
+
+            page.merge_translated_page(stamp_page, position_x, position_y)
+            pdf_writer.add_page(page)
+
+        with open(output_path, "wb") as f:
+            pdf_writer.write(f)
+        log_message(f"已處理並儲存 PDF：{output_path}")
+
+        os.remove(temp_stamp_path)
+        os.remove(stamp_pdf_path)
+        log_message("已清理臨時檔案")
+
+    except Exception as e:
+        log_message(f"處理 PDF 時出錯：{e}")
+        show_error_message("錯誤", f"處理 PDF 時出錯：{e}")
+        raise
+
+# 主程式
+log_message("程式開始執行")
+try:
+    result = create_drag_window()
+    if result is None:
+        log_message("拖曳視窗未返回有效偏移量，程式中止")
+        show_error_message("錯誤", "拖曳視窗未返回有效偏移量，程式中止")
+        raise Exception("拖曳視窗未正確執行")
+    offset_x_points, offset_y_points = result
+    log_message(f"拖曳完成，偏移量：X={offset_x_points}, Y={offset_y_points}")
+except Exception as e:
+    log_message(f"拖曳視窗出錯：{e}")
+    show_error_message("錯誤", f"拖曳視窗出錯：{e}")
+    raise
+
+# 遍歷來源資料夾中的檔案
+for filename in os.listdir(source_folder):
+    file_path = os.path.join(source_folder, filename)
+    output_path = os.path.join(target_folder, filename)
+
+    try:
+        if filename.lower().endswith(supported_image_formats):
+            log_message(f"開始處理圖片檔案：{file_path}")
+            process_image(file_path, output_path)
+        elif filename.lower().endswith(supported_pdf_formats):
+            log_message(f"開始處理 PDF 檔案：{file_path}")
+            process_pdf(file_path, output_path)
+        else:
+            log_message(f"跳過不支援的檔案：{file_path}")
+    except Exception as e:
+        log_message(f"處理檔案 {file_path} 時出錯：{e}")
+        show_error_message("錯誤", f"處理檔案 {file_path} 時出錯：{e}")
+        continue  # 繼續處理下一個檔案
+
+log_message("批次處理完成！")
